@@ -1,3 +1,6 @@
+# Libtorch (install separately)
+library/inference_runtime/libtorch/
+
 # ROS2 build artifacts
 build/
 install/

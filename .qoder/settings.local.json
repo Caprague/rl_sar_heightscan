@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git rm -rf --cached src/rl_sar_zoo 2>&1 | tail -3)",
+      "Bash(git submodule add https://github.com/fan-ziqi/rl_sar_zoo.git src/rl_sar_zoo 2>&1)",
+      "Bash(rm -rf /home/nvidia/HumbleRos/rl_sar/src/rl_sar_zoo && git submodule add https://github.com/fan-ziqi/rl_sar_zoo.git src/rl_sar_zoo 2>&1)"
+    ]
+  }
+}
