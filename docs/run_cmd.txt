@@ -1,0 +1,3 @@
+foxy_ros_source
+
+ros2 run rl_sar rl_real_go2 eth0

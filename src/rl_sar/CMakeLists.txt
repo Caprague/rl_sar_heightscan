@@ -479,6 +479,10 @@ endif()
 # executable for rl real go2
 if(SYSTEM_TYPE STREQUAL "Linux")
     add_executable(rl_real_go2 src/rl_real_go2.cpp)
+    target_include_directories(rl_real_go2 BEFORE PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/library/thirdparty/robot_sdk/unitree/unitree_sdk2/thirdparty/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/library/thirdparty/robot_sdk/unitree/unitree_sdk2/thirdparty/include/ddscxx
+    )
     target_link_libraries(rl_real_go2
         unitree_sdk2
         rl_sdk
@@ -506,6 +510,10 @@ endif()
 # executable for rl real g1
 if(SYSTEM_TYPE STREQUAL "Linux")
     add_executable(rl_real_g1 src/rl_real_g1.cpp)
+    target_include_directories(rl_real_g1 BEFORE PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/library/thirdparty/robot_sdk/unitree/unitree_sdk2/thirdparty/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/library/thirdparty/robot_sdk/unitree/unitree_sdk2/thirdparty/include/ddscxx
+    )
     target_link_libraries(rl_real_g1
         unitree_sdk2
         rl_sdk
