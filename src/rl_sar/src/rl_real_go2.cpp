@@ -5,20 +5,20 @@
 
 #include "rl_real_go2.hpp"
 
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <cstring>
+
 RL_Real::RL_Real(int argc, char **argv)
+    : hs_sock_(-1),
+      ss_sock_(-1),
+      udp_running_(false),
+      height_scan_received_(false),
+      safety_status_safe_(true),
+      safety_status_received_(false)
 {
     bool wheel_mode = (argc > 2 && std::string(argv[2]) == "wheel");
-
-#if defined(USE_ROS1) && defined(USE_ROS)
-    ros::NodeHandle nh;
-    this->cmd_vel_subscriber = nh.subscribe<geometry_msgs::Twist>("/cmd_vel", 10, &RL_Real::CmdvelCallback, this);
-#elif defined(USE_ROS2) && defined(USE_ROS)
-    ros2_node = std::make_shared<rclcpp::Node>("rl_real_node");
-    this->cmd_vel_subscriber = ros2_node->create_subscription<geometry_msgs::msg::Twist>(
-        "/cmd_vel", rclcpp::SystemDefaultsQoS(),
-        [this] (const geometry_msgs::msg::Twist::SharedPtr msg) {this->CmdvelCallback(msg);}
-    );
-#endif
 
     // read params from yaml
     this->ang_vel_axis = "body";
@@ -53,24 +53,10 @@ RL_Real::RL_Real(int argc, char **argv)
     // create joystick subscriber
     this->joystick_subscriber.reset(new ChannelSubscriber<unitree_go::msg::dds_::WirelessController_>(TOPIC_JOYSTICK));
     this->joystick_subscriber->InitChannel(std::bind(&RL_Real::JoystickHandler, this, std::placeholders::_1), 1);
-#if defined(USE_ROS2) && defined(USE_ROS)
-    // create height scan subscriber
-    this->height_scan_subscriber = ros2_node->create_subscription<std_msgs::msg::Float32MultiArray>(
-        TOPIC_HEIGHTSCAN, rclcpp::SystemDefaultsQoS(),
-        [this] (const std_msgs::msg::Float32MultiArray::SharedPtr msg) {this->HeightScanCallback(msg);}
-    );
-    // create safety status subscriber
-    this->safety_status_subscriber = ros2_node->create_subscription<std_msgs::msg::Bool>(
-        "/safety_guardian/status", rclcpp::SystemDefaultsQoS(),
-        [this] (const std_msgs::msg::Bool::SharedPtr msg) {this->SafetyStatusCallback(msg);}
-    );
-    // 初始化安全状态监控变量
-    this->safety_status_received = false;
-    this->safety_status_safe = true;
-    this->unsafe_message_count = 0;
-    this->last_safety_status_time = ros2_node->get_clock()->now();
-    this->emergency_shutdown_triggered = false;
-#endif
+
+    // init UDP receivers
+    this->start_udp_receivers();
+
     // init MotionSwitcherClient
     this->msc.SetTimeout(10.0f);
     this->msc.Init();
@@ -120,49 +106,144 @@ RL_Real::~RL_Real()
 #ifdef PLOT
     this->loop_plot->shutdown();
 #endif
+    this->stop_udp_receivers();
     std::cout << LOGGER::INFO << "RL_Real exit" << std::endl;
 }
 
-void RL_Real::GetState(RobotState<float> *state)
+// ============================================================================
+// UDP Receiver
+// ============================================================================
+
+void RL_Real::start_udp_receivers()
 {
-#if defined(USE_ROS2) && defined(USE_ROS)
-    // 检查安全状态
-    bool is_safe = true;
-    if (!this->safety_status_received)
+    udp_running_ = true;
+
+    // Height scan UDP socket (port 9870, receives 187 floats = 748 bytes)
+    hs_sock_ = socket(AF_INET, SOCK_DGRAM, 0);
+    if (hs_sock_ >= 0)
     {
-        // 未收到安全状态消息，检查超时
-        auto current_time = ros2_node->get_clock()->now();
-        double time_since_last = (current_time - this->last_safety_status_time).seconds();
-        if (time_since_last > this->safety_status_timeout)
+        int opt = 1;
+        setsockopt(hs_sock_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        struct sockaddr_in addr;
+        std::memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(UDP_HEIGHTSCAN_PORT);
+
+        if (bind(hs_sock_, (struct sockaddr*)&addr, sizeof(addr)) == 0)
         {
-            is_safe = false;
-            std::cout << LOGGER::WARNING << "Safety status timeout: " 
-                      << time_since_last << "s (threshold: " << this->safety_status_timeout << "s)" << std::endl;
+            struct timeval tv;
+            tv.tv_sec = 1;
+            tv.tv_usec = 0;
+            setsockopt(hs_sock_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+            hs_recv_thread_ = std::thread(&RL_Real::height_scan_udp_loop, this);
+            std::cout << LOGGER::INFO << "[UDP] Height scan receiver started on port " << UDP_HEIGHTSCAN_PORT << std::endl;
+        }
+        else
+        {
+            std::cout << LOGGER::ERROR << "[UDP] Failed to bind height scan port " << UDP_HEIGHTSCAN_PORT << std::endl;
+            close(hs_sock_);
+            hs_sock_ = -1;
         }
     }
-    else if (!this->safety_status_safe)
+
+    // Safety status UDP socket (port 9871, receives 1 byte: 0=unsafe, 1=safe)
+    ss_sock_ = socket(AF_INET, SOCK_DGRAM, 0);
+    if (ss_sock_ >= 0)
     {
-        // 收到不安全状态
-        is_safe = false;
+        int opt = 1;
+        setsockopt(ss_sock_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        struct sockaddr_in addr;
+        std::memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(UDP_SAFETY_STATUS_PORT);
+
+        if (bind(ss_sock_, (struct sockaddr*)&addr, sizeof(addr)) == 0)
+        {
+            struct timeval tv;
+            tv.tv_sec = 1;
+            tv.tv_usec = 0;
+            setsockopt(ss_sock_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+            ss_recv_thread_ = std::thread(&RL_Real::safety_status_udp_loop, this);
+            std::cout << LOGGER::INFO << "[UDP] Safety status receiver started on port " << UDP_SAFETY_STATUS_PORT << std::endl;
+        }
+        else
+        {
+            std::cout << LOGGER::ERROR << "[UDP] Failed to bind safety status port " << UDP_SAFETY_STATUS_PORT << std::endl;
+            close(ss_sock_);
+            ss_sock_ = -1;
+        }
     }
-    
-    // 如果不安全，锁定速度指令为0
-    if (!is_safe)
+}
+
+void RL_Real::stop_udp_receivers()
+{
+    udp_running_ = false;
+    if (hs_recv_thread_.joinable()) hs_recv_thread_.join();
+    if (ss_recv_thread_.joinable()) ss_recv_thread_.join();
+    if (hs_sock_ >= 0) { close(hs_sock_); hs_sock_ = -1; }
+    if (ss_sock_ >= 0) { close(ss_sock_); ss_sock_ = -1; }
+}
+
+void RL_Real::height_scan_udp_loop()
+{
+    const int expected_floats = 11 * 17;
+    const int expected_bytes = expected_floats * sizeof(float);
+    std::vector<char> buf(expected_bytes);
+
+    while (udp_running_)
     {
+        ssize_t n = recv(hs_sock_, buf.data(), buf.size(), 0);
+        if (n < 0) continue; // timeout
+
+        if (n != expected_bytes) continue; // wrong size, skip
+
+        std::lock_guard<std::mutex> lock(height_scan_mutex_);
+        height_scan_data_.resize(expected_floats);
+        std::memcpy(height_scan_data_.data(), buf.data(), expected_bytes);
+        height_scan_received_ = true;
+    }
+}
+
+void RL_Real::safety_status_udp_loop()
+{
+    char buf[1];
+    while (udp_running_)
+    {
+        ssize_t n = recv(ss_sock_, buf, sizeof(buf), 0);
+        if (n < 0) continue; // timeout
+
+        if (n == 1)
+        {
+            safety_status_safe_ = (buf[0] != 0);
+            safety_status_received_ = true;
+        }
+    }
+}
+
+// ============================================================================
+// Control Logic
+// ============================================================================
+
+void RL_Real::GetState(RobotState<float> *state)
+{
+    // Check safety status from UDP
+    if (!this->safety_status_received_)
+    {
+        // No safety status received yet - treat as safe (default behavior)
+    }
+    else if (!this->safety_status_safe_.load())
+    {
+        // Unsafe - lock velocity commands to zero
         this->control.x = 0.0f;
         this->control.y = 0.0f;
         this->control.yaw = 0.0f;
-        
-        // 检查是否达到趴下阈值
-        if (this->unsafe_message_count >= this->unsafe_threshold && !this->emergency_shutdown_triggered)
-        {
-            this->emergency_shutdown_triggered = true;
-            std::cout << LOGGER::ERROR << "Emergency shutdown triggered! Switching to passive mode..." << std::endl;
-            // 通过FSM请求切换到被动模式（趴下）
-            this->fsm.RequestStateChange("RLFSMStatePassive");
-        }
     }
-#endif
 
     if (this->unitree_joy.components.A) this->control.SetGamepad(Input::Gamepad::A);
     if (this->unitree_joy.components.B) this->control.SetGamepad(Input::Gamepad::B);
@@ -197,15 +278,15 @@ void RL_Real::GetState(RobotState<float> *state)
     if (this->unitree_joy.components.R1 && this->unitree_joy.components.left) this->control.SetGamepad(Input::Gamepad::RB_DPadLeft);
     if (this->unitree_joy.components.R1 && this->unitree_joy.components.right) this->control.SetGamepad(Input::Gamepad::RB_DPadRight);
     if (this->unitree_joy.components.L1 && this->unitree_joy.components.R1) this->control.SetGamepad(Input::Gamepad::LB_RB);
-    
+
     // Raw inputs
-    float raw_x = this->joystick.ly();      // forward/backward
-    float raw_y = -this->joystick.lx();     // left/right (note sign)
+    float raw_x = this->joystick.ly();
+    float raw_y = -this->joystick.lx();
     float raw_yaw = -this->joystick.rx();
 
     // Quantization parameters
-    const float deadzone = 0.2f;   // dead zone: [-0.2, 0.2] → 0
-    const float mid_thres = 0.8f;  // transition from low to high speed
+    const float deadzone = 0.2f;
+    const float mid_thres = 0.8f;
     const float v_low = 0.3f;
     const float v_high = 0.5f;
 
@@ -246,30 +327,10 @@ void RL_Real::GetState(RobotState<float> *state)
     }
     this->control.yaw = raw_yaw;
 
-    // float dx = raw_x - control.x;
-    // if (dx > 0.05f) {
-    //     control.x += 0.05f;
-    // } else if (dx < -0.05f) {
-    //     control.x -= 0.05f;
-    // } else {
-    //     control.x = raw_x; // 包含 dx == 0 的情况
-    // }
-
-    // float dy = raw_y - control.y;
-    // if (dy > 0.05f) {
-    //     control.y += 0.05f;
-    // } else if (dy < -0.05f) {
-    //     control.y -= 0.05f;
-    // } else {
-    //     control.y = raw_y; // 包含 dy == 0 的情况
-    // }
-    
-    // this->control.yaw = -this->joystick.rx();
-
-    state->imu.quaternion[0] = this->unitree_low_state.imu_state().quaternion()[0]; // w
-    state->imu.quaternion[1] = this->unitree_low_state.imu_state().quaternion()[1]; // x
-    state->imu.quaternion[2] = this->unitree_low_state.imu_state().quaternion()[2]; // y
-    state->imu.quaternion[3] = this->unitree_low_state.imu_state().quaternion()[3]; // z
+    state->imu.quaternion[0] = this->unitree_low_state.imu_state().quaternion()[0];
+    state->imu.quaternion[1] = this->unitree_low_state.imu_state().quaternion()[1];
+    state->imu.quaternion[2] = this->unitree_low_state.imu_state().quaternion()[2];
+    state->imu.quaternion[3] = this->unitree_low_state.imu_state().quaternion()[3];
 
     for (int i = 0; i < 3; ++i)
     {
@@ -317,13 +378,6 @@ void RL_Real::RunModel()
         this->episode_length_buf += 1;
         this->obs.ang_vel = this->robot_state.imu.gyroscope;
         this->obs.commands = {this->control.x, this->control.y, this->control.yaw};
-#if !defined(USE_CMAKE) && defined(USE_ROS)
-        if (this->control.navigation_mode)
-        {
-            this->obs.commands = {(float)this->cmd_vel.linear.x, (float)this->cmd_vel.linear.y, (float)this->cmd_vel.angular.z};
-
-        }
-#endif
         this->obs.base_quat = this->robot_state.imu.quaternion;
 
         this->real_dof_pos = this->robot_state.motor_state.q;
@@ -331,21 +385,24 @@ void RL_Real::RunModel()
         this->remapJointData(this->real_dof_pos, this->params.Get<std::vector<int>>("remap_joint_real2policy"), this->obs.dof_pos);
         this->remapJointData(this->real_dof_vel, this->params.Get<std::vector<int>>("remap_joint_real2policy"), this->obs.dof_vel);
 
-        // this->obs.height_scan = std::vector<float>(11*17, 0.32f);
-#if defined(USE_ROS2) && defined(USE_ROS)
-        if (this->height_scan_msg.data.size() == 11*17)
+        // Get height scan from UDP receiver
+        if (this->height_scan_received_.load())
         {
-            this->obs.height_scan = this->height_scan_msg.data;
+            std::lock_guard<std::mutex> lock(this->height_scan_mutex_);
+            if (this->height_scan_data_.size() == 11 * 17)
+            {
+                this->obs.height_scan = this->height_scan_data_;
+            }
+            else
+            {
+                this->obs.height_scan = std::vector<float>(11 * 17, 0.3f);
+            }
         }
         else
         {
-            this->obs.height_scan = std::vector<float>(11*17, 0.3f);
-            std::cout << "\n !!!! Warning: height_scan is not received !!!! " << std::endl;
+            this->obs.height_scan = std::vector<float>(11 * 17, 0.3f);
+            std::cout << "\n !!!! Warning: height_scan is not received via UDP !!!! " << std::endl;
         }
-#else
-        this->obs.height_scan = std::vector<float>(11*17, 0.3f);
-        std::cout << "Warning: height_scan is not received" << std::endl;
-#endif
 
 #ifdef PRINT_OBS_ORIGINAL
         std::cout << "-------------------------------------------------------------" << std::endl;
@@ -360,9 +417,6 @@ void RL_Real::RunModel()
 
         this->obs.actions = this->Forward();
         this->remapJointData(this->obs.actions, this->params.Get<std::vector<int>>("remap_joint_policy2real"), this->processed_actions);
-
-        // 临时保护，actions 全部设为 0
-        // this->processed_actions = std::vector<float>(this->params.Get<int>("num_of_dofs"), 0.0f);
 
         this->ComputeOutput(this->processed_actions, this->output_dof_pos, this->output_dof_vel, this->output_dof_tau);
 
@@ -379,9 +433,6 @@ void RL_Real::RunModel()
             output_dof_tau_queue.push(this->output_dof_tau);
         }
 
-        // this->TorqueProtect(this->output_dof_tau);
-        // this->AttitudeProtect(this->robot_state.imu.quaternion, 75.0f, 75.0f);
-
 #ifdef CSV_LOGGER
         std::vector<float> tau_est = this->robot_state.motor_state.tau_est;
         this->CSVLogger(this->output_dof_tau, tau_est, this->obs.dof_pos, this->output_dof_pos, this->obs.dof_vel);
@@ -393,7 +444,6 @@ std::vector<float> RL_Real::Forward()
 {
     std::unique_lock<std::mutex> lock(this->model_mutex, std::try_to_lock);
 
-    // If model is being reinitialized, return previous actions to avoid blocking
     if (!lock.owns_lock())
     {
         std::cout << LOGGER::WARNING << "Model is being reinitialized, using previous actions" << std::endl;
@@ -447,7 +497,6 @@ void RL_Real::Plot()
         plt::named_plot("_target_joint_pos", this->plot_t, this->plot_target_joint_pos[i], "b");
         plt::xlim(this->plot_t.front(), this->plot_t.back());
     }
-    // plt::legend();
     plt::pause(0.0001);
 }
 
@@ -462,7 +511,7 @@ uint32_t RL_Real::Crc32Core(uint32_t *ptr, uint32_t len)
     {
         xbit = 1 << 31;
         data = ptr[i];
-        for (unsigned int bits = 0; bits < 32; bits++)
+        for (unsigned int bits = 0; bits < 32; ++bits)
         {
             if (CRC32 & 0x80000000)
             {
@@ -494,7 +543,7 @@ void RL_Real::InitLowCmd()
 
     for (int i = 0; i < 20; ++i)
     {
-        this->unitree_low_command.motor_cmd()[i].mode() = (0x01); // motor switch to servo (PMSM) mode
+        this->unitree_low_command.motor_cmd()[i].mode() = (0x01);
         this->unitree_low_command.motor_cmd()[i].q() = (PosStopF);
         this->unitree_low_command.motor_cmd()[i].kp() = (0);
         this->unitree_low_command.motor_cmd()[i].dq() = (VelStopF);
@@ -557,62 +606,12 @@ void RL_Real::JoystickHandler(const void *message)
     this->unitree_joy.value = joystick.keys();
 }
 
-#if defined(USE_ROS2) && defined(USE_ROS)
-void RL_Real::HeightScanCallback(const std_msgs::msg::Float32MultiArray::SharedPtr msg)
-{
-    this->height_scan_msg = *msg;
-}
-#endif
-
-#if defined(USE_ROS2) && defined(USE_ROS)
-void RL_Real::SafetyStatusCallback(const std_msgs::msg::Bool::SharedPtr msg)
-{
-    this->safety_status_msg = *msg;
-    this->safety_status_received = true;
-    this->safety_status_safe = msg->data;
-    this->last_safety_status_time = ros2_node->get_clock()->now();
-    
-    if (!msg->data)
-    {
-        this->unsafe_message_count++;
-        std::cout << LOGGER::WARNING << "Safety status: UNSAFE (count: " 
-                  << this->unsafe_message_count << "/" << this->unsafe_threshold << ")" << std::endl;
-    }
-    else
-    {
-        this->unsafe_message_count = 0;
-    }
-}
-#endif
-
-#if !defined(USE_CMAKE) && defined(USE_ROS)
-void RL_Real::CmdvelCallback(
-#if defined(USE_ROS1) && defined(USE_ROS)
-    const geometry_msgs::Twist::ConstPtr &msg
-#elif defined(USE_ROS2) && defined(USE_ROS)
-    const geometry_msgs::msg::Twist::SharedPtr msg
-#endif
-)
-{
-    this->cmd_vel = *msg;
-}
-#endif
-
-#if defined(USE_ROS1) && defined(USE_ROS)
-void signalHandler(int signum)
-{
-    ros::shutdown();
-    exit(0);
-}
-#elif defined(USE_CMAKE) || !defined(USE_ROS)
-// Signal handler for CMAKE mode
 volatile sig_atomic_t g_shutdown_requested = 0;
 void signalHandler(int signum)
 {
     std::cout << LOGGER::INFO << "Received signal " << signum << ", shutting down..." << std::endl;
     g_shutdown_requested = 1;
 }
-#endif
 
 int main(int argc, char **argv)
 {
@@ -621,24 +620,13 @@ int main(int argc, char **argv)
         std::cout << LOGGER::ERROR << "Usage: " << argv[0] << " networkInterface [wheel]" << std::endl;
         throw std::runtime_error("Invalid arguments");
     }
+
+    signal(SIGINT, signalHandler);
     ChannelFactory::Instance()->Init(0, argv[1]);
 
-#if defined(USE_ROS1) && defined(USE_ROS)
-    signal(SIGINT, signalHandler);
-    ros::init(argc, argv, "rl_sar");
-    RL_Real rl_sar(argc, argv);
-    ros::spin();
-#elif defined(USE_ROS2) && defined(USE_ROS)
-    rclcpp::init(argc, argv);
-    auto rl_sar = std::make_shared<RL_Real>(argc, argv);
-    rclcpp::spin(rl_sar->ros2_node);
-    rclcpp::shutdown();
-#elif defined(USE_CMAKE) || !defined(USE_ROS)
-    signal(SIGINT, signalHandler);
     RL_Real rl_sar(argc, argv);
     while (!g_shutdown_requested) { sleep(1); }
     std::cout << LOGGER::INFO << "Exiting..." << std::endl;
-#endif
 
     return 0;
 }

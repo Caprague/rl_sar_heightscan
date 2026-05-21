@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypenamespace="http://download.ros.org/schema/package_format3.xsd"?>
+<package format="3">
+    <name>udp_test_bridge</name>
+    <version>0.1.0</version>
+    <description>UDP receiver test node for height_scan and safety_status monitoring</description>
+    <maintainer email="unitree@unitree.com">unitree</maintainer>
+    <license>Apache-2.0</license>
+
+    <buildtool_depend>ament_cmake</buildtool_depend>
+    <depend>rclcpp</depend>
+
+    <exec_depend>launch</exec_depend>
+    <exec_depend>launch_ros</exec_depend>
+</package>

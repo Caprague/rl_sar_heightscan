@@ -8,8 +8,6 @@
 
 // #define PLOT
 // #define CSV_LOGGER
-#define USE_ROS
-#define USE_ROS2
 
 #include "rl_sdk.hpp"
 #include "observation_buffer.hpp"
@@ -28,16 +26,6 @@
 #include <unitree/robot/b2/motion_switcher/motion_switcher_client.hpp>
 #include <csignal>
 
-#if defined(USE_ROS1) && defined(USE_ROS)
-#include <ros/ros.h>
-#include <geometry_msgs/Twist.h>
-#elif defined(USE_ROS2) && defined(USE_ROS)
-#include <rclcpp/rclcpp.hpp>
-#include <geometry_msgs/msg/twist.hpp>
-#include <std_msgs/msg/bool.hpp>
-#include <std_msgs/msg/float32_multi_array.hpp>
-#endif
-
 #include "matplotlibcpp.h"
 namespace plt = matplotlibcpp;
 
@@ -50,7 +38,11 @@ using namespace unitree::robot::b2;
 constexpr double PosStopF = (2.146E+9f);
 constexpr double VelStopF = (16000.0f);
 
-#define TOPIC_HEIGHTSCAN "/nvblox_node/locomotion_height_scan"
+// UDP port for height_scan data from external Jetson
+#define UDP_HEIGHTSCAN_PORT 9870
+// UDP port for safety status from external Jetson
+#define UDP_SAFETY_STATUS_PORT 9871
+
 #define PRINT_OBS_ORIGINAL
 
 // union for joystick keys
@@ -83,10 +75,6 @@ class RL_Real : public RL
 public:
     RL_Real(int argc, char **argv);
     ~RL_Real();
-
-#if defined(USE_ROS2) && defined(USE_ROS)
-    std::shared_ptr<rclcpp::Node> ros2_node;
-#endif
 
 private:
     // rl functions
@@ -128,32 +116,26 @@ private:
     std::vector<float> mapped_joint_positions;
     std::vector<float> mapped_joint_velocities;
 
-#if defined(USE_ROS1) && defined(USE_ROS)
-    geometry_msgs::Twist cmd_vel;
-    ros::Subscriber cmd_vel_subscriber;
-    void CmdvelCallback(const geometry_msgs::Twist::ConstPtr &msg);
-#elif defined(USE_ROS2) && defined(USE_ROS)
-    geometry_msgs::msg::Twist cmd_vel;
-    rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_subscriber;
-    void CmdvelCallback(const geometry_msgs::msg::Twist::SharedPtr msg);
-    std_msgs::msg::Float32MultiArray height_scan_msg;
-    rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr height_scan_subscriber;
-    void HeightScanCallback(const std_msgs::msg::Float32MultiArray::SharedPtr msg);
-    
-    // 安全状态订阅
-    std_msgs::msg::Bool safety_status_msg;
-    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr safety_status_subscriber;
-    void SafetyStatusCallback(const std_msgs::msg::Bool::SharedPtr msg);
-    
-    // 安全状态监控变量
-    bool safety_status_received;
-    bool safety_status_safe;
-    int unsafe_message_count;
-    rclcpp::Time last_safety_status_time;
-    const double safety_status_timeout = 0.5;  // 安全状态超时时间（秒）
-    const int unsafe_threshold = 10;  // 不安全消息阈值
-    bool emergency_shutdown_triggered;
-#endif
+    // UDP receivers
+    void start_udp_receivers();
+    void stop_udp_receivers();
+    void height_scan_udp_loop();
+    void safety_status_udp_loop();
+
+    int hs_sock_;
+    int ss_sock_;
+    std::thread hs_recv_thread_;
+    std::thread ss_recv_thread_;
+    std::atomic<bool> udp_running_;
+
+    // Height scan data (11x17 floats)
+    std::vector<float> height_scan_data_;
+    std::mutex height_scan_mutex_;
+    std::atomic<bool> height_scan_received_;
+
+    // Safety status (single byte: 0=unsafe, 1=safe)
+    std::atomic<bool> safety_status_safe_;
+    std::atomic<bool> safety_status_received_;
 };
 
 #endif // RL_REAL_GO2_HPP
