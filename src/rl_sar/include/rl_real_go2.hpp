@@ -8,6 +8,7 @@
 
 // #define PLOT
 // #define CSV_LOGGER
+// #define PRINT_OBS_ORIGINAL
 
 #include "rl_sdk.hpp"
 #include "observation_buffer.hpp"
@@ -42,8 +43,6 @@ constexpr double VelStopF = (16000.0f);
 #define UDP_HEIGHTSCAN_PORT 9870
 // UDP port for safety status from external Jetson
 #define UDP_SAFETY_STATUS_PORT 9871
-
-#define PRINT_OBS_ORIGINAL
 
 // union for joystick keys
 typedef union
@@ -83,6 +82,7 @@ private:
     void SetCommand(const RobotCommand<float> *command) override;
     void RunModel();
     void RobotControl();
+    void CheckStartupGuard();
 
     // loop
     std::shared_ptr<LoopFunc> loop_keyboard;
@@ -136,6 +136,8 @@ private:
     // Safety status (single byte: 0=unsafe, 1=safe)
     std::atomic<bool> safety_status_safe_;
     std::atomic<bool> safety_status_received_;
+    std::atomic<int> safety_unsafe_streak_count_;
+    std::atomic<bool> safety_trigger_getdown_;
 };
 
 #endif // RL_REAL_GO2_HPP

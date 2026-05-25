@@ -9,14 +9,17 @@
 #include <netinet/in.h>
 #include <unistd.h>
 #include <cstring>
+#include <chrono>
 
 RL_Real::RL_Real(int argc, char **argv)
     : hs_sock_(-1),
       ss_sock_(-1),
       udp_running_(false),
       height_scan_received_(false),
-      safety_status_safe_(true),
-      safety_status_received_(false)
+      safety_status_received_(false),
+      safety_status_safe_(false),
+      safety_unsafe_streak_count_(0),
+      safety_trigger_getdown_(false)
 {
     bool wheel_mode = (argc > 2 && std::string(argv[2]) == "wheel");
 
@@ -220,8 +223,22 @@ void RL_Real::safety_status_udp_loop()
 
         if (n == 1)
         {
-            safety_status_safe_ = (buf[0] != 0);
+            const bool is_safe = (buf[0] != 0);
+            safety_status_safe_ = is_safe;
             safety_status_received_ = true;
+
+            if (is_safe)
+            {
+                safety_unsafe_streak_count_ = 0;
+            }
+            else
+            {
+                const int streak = ++safety_unsafe_streak_count_;
+                if (streak >= 10)
+                {
+                    safety_trigger_getdown_ = true;
+                }
+            }
         }
     }
 }
@@ -232,19 +249,6 @@ void RL_Real::safety_status_udp_loop()
 
 void RL_Real::GetState(RobotState<float> *state)
 {
-    // Check safety status from UDP
-    if (!this->safety_status_received_)
-    {
-        // No safety status received yet - treat as safe (default behavior)
-    }
-    else if (!this->safety_status_safe_.load())
-    {
-        // Unsafe - lock velocity commands to zero
-        this->control.x = 0.0f;
-        this->control.y = 0.0f;
-        this->control.yaw = 0.0f;
-    }
-
     if (this->unitree_joy.components.A) this->control.SetGamepad(Input::Gamepad::A);
     if (this->unitree_joy.components.B) this->control.SetGamepad(Input::Gamepad::B);
     if (this->unitree_joy.components.X) this->control.SetGamepad(Input::Gamepad::X);
@@ -327,6 +331,17 @@ void RL_Real::GetState(RobotState<float> *state)
     }
     this->control.yaw = raw_yaw;
 
+    if (!this->safety_status_safe_.load())
+    {
+        this->control.x = 0.0f;
+        this->control.y = 0.0f;
+        this->control.yaw = 0.0f;
+    }
+    if (this->safety_trigger_getdown_.load())
+    {
+        this->fsm.RequestStateChange("RLFSMStateGetDown");
+    }
+
     state->imu.quaternion[0] = this->unitree_low_state.imu_state().quaternion()[0];
     state->imu.quaternion[1] = this->unitree_low_state.imu_state().quaternion()[1];
     state->imu.quaternion[2] = this->unitree_low_state.imu_state().quaternion()[2];
@@ -364,11 +379,52 @@ void RL_Real::RobotControl()
 {
     this->GetState(&this->robot_state);
 
+    this->CheckStartupGuard();
+
     this->StateController(&this->robot_state, &this->robot_command);
 
     this->control.ClearInput();
 
     this->SetCommand(&this->robot_command);
+}
+
+void RL_Real::CheckStartupGuard()
+{
+    static bool startup_guard_enabled = true;
+    static auto last_check_tp = std::chrono::steady_clock::now();
+
+    if (!startup_guard_enabled)
+    {
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::seconds>(now - last_check_tp).count() < 1)
+    {
+        return;
+    }
+
+    last_check_tp = now;
+    const bool hs_ok = this->height_scan_received_.load();
+    const bool ss_ok = this->safety_status_received_.load();
+
+    if (hs_ok && ss_ok)
+    {
+        startup_guard_enabled = false;
+        std::cout << LOGGER::INFO << "[StartupGuard] height_scan and safety_status are ready, guard disabled." << std::endl;
+        return;
+    }
+
+    if (!hs_ok || !ss_ok)
+    {
+        std::cout << LOGGER::WARNING << "[StartupGuard] Missing UDP inputs. height_scan_received="
+                  << hs_ok << ", safety_status_received=" << ss_ok << std::endl;
+
+        if (this->fsm.current_state_ && this->fsm.current_state_->GetStateName() != "RLFSMStatePassive")
+        {
+            this->fsm.RequestStateChange("RLFSMStatePassive");
+        }
+    }
 }
 
 void RL_Real::RunModel()
@@ -417,7 +473,6 @@ void RL_Real::RunModel()
 
         this->obs.actions = this->Forward();
         this->remapJointData(this->obs.actions, this->params.Get<std::vector<int>>("remap_joint_policy2real"), this->processed_actions);
-
         this->ComputeOutput(this->processed_actions, this->output_dof_pos, this->output_dof_vel, this->output_dof_tau);
 
         if (!this->output_dof_pos.empty())
@@ -630,3 +685,5 @@ int main(int argc, char **argv)
 
     return 0;
 }
+
+
